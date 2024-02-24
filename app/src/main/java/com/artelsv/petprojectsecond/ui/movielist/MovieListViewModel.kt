@@ -2,72 +2,119 @@ package com.artelsv.petprojectsecond.ui.movielist
 
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.viewModelScope
+import androidx.paging.CombinedLoadStates
+import androidx.paging.LoadState
+import androidx.paging.PagingData
+import androidx.paging.rxjava2.cachedIn
+import com.artelsv.petprojectsecond.domain.model.movie.Movie
+import com.artelsv.petprojectsecond.domain.model.movie.MovieSortType
+import com.artelsv.petprojectsecond.domain.model.User
+import com.artelsv.petprojectsecond.domain.usecases.movies.GetNowPlayingMoviesUseCase
+import com.artelsv.petprojectsecond.domain.usecases.movies.GetPopularMoviesUseCase
+import com.artelsv.petprojectsecond.domain.usecases.user.GetUserUseCase
+import com.artelsv.petprojectsecond.domain.usecases.user.usermovies.SyncLocalUserListsUseCase
+import com.artelsv.petprojectsecond.ui.Screens
 import com.artelsv.petprojectsecond.ui.base.BaseViewModel
-import com.artelsv.petprojectsecond.domain.model.Movie
-import com.artelsv.petprojectsecond.domain.model.MovieSortType
-import com.artelsv.petprojectsecond.domain.model.MovieType
-import com.artelsv.petprojectsecond.domain.usecases.GetNowPlayingMoviesUseCase
-import com.artelsv.petprojectsecond.domain.usecases.GetPopularMoviesUseCase
-import io.reactivex.Single
+import com.github.terrakok.cicerone.Router
+import io.reactivex.Flowable
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import timber.log.Timber
 import javax.inject.Inject
 
+@ExperimentalCoroutinesApi
 class MovieListViewModel @Inject constructor(
     private val getPopularMoviesUseCase: GetPopularMoviesUseCase,
-    private val getNowPlayingMoviesUseCase: GetNowPlayingMoviesUseCase
+    private val getNowPlayingMoviesUseCase: GetNowPlayingMoviesUseCase,
+    private val getUserUseCase: GetUserUseCase,
+    private val syncLocalUserListsUseCase: SyncLocalUserListsUseCase,
+    private val router: Router,
 ) : BaseViewModel() {
 
-    private val mPopularMovies = MutableLiveData<List<Movie>?>(listOf())
-    val popularMovies: LiveData<List<Movie>?> = mPopularMovies
-    private val mNowPlayingMovies = MutableLiveData<List<Movie>?>(listOf())
-    val nowPlayingMovies: LiveData<List<Movie>?> = mNowPlayingMovies
+    val user = MutableLiveData<User>(null)
 
-    val loading = MutableLiveData(true)
+    val loadingPopular = MutableLiveData(false)
+    val loadingNowPlaying = MutableLiveData(false)
     val error = MutableLiveData(false)
 
+    private val mNowPlayingPagingLiveData = MutableLiveData<PagingData<Movie>>(null)
+    val nowPlayingPagingLiveData: LiveData<PagingData<Movie>> = mNowPlayingPagingLiveData
+
+    private val mPopularPagingLiveData = MutableLiveData<PagingData<Movie>>(null)
+    val popularPagingLiveData: LiveData<PagingData<Movie>> = mPopularPagingLiveData
+
+    val nowPlayingAdapter: MovieAdapter = MovieAdapter {
+        it?.let {
+            navigateToMovieDetail(it.id)
+        }
+    }.apply {
+        withLoadStateHeaderAndFooter(header = MovieLoaderStateAdapter(), footer = MovieLoaderStateAdapter())
+        addLoadStateListener { state ->
+            loadingNowPlaying.postValue(state.refresh != LoadState.Loading)
+        }
+    }
+
+    val popularAdapter: MovieAdapter = MovieAdapter {
+        it?.let {
+            navigateToMovieDetail(it.id)
+        }
+    }.apply {
+        withLoadStateHeaderAndFooter(header = MovieLoaderStateAdapter(), footer = MovieLoaderStateAdapter())
+        addLoadStateListener { state ->
+            loadingPopular.postValue(state.refresh != LoadState.Loading)
+        }
+    }
+
     init {
-        getMovies()
+        setup()
     }
 
-    fun getMovies(sortType: MovieSortType = MovieSortType.NO) {
-        val popularSingle = getPopularMoviesUseCase.invoke(MovieSortType.NO)
-        val newSingle = getNowPlayingMoviesUseCase.invoke(sortType)
-//        val newSingle = Single.error<List<Movie>>(Throwable("a"))
+    fun processNowPlayingLoading() {
+        loadingNowPlaying.postValue(true)
+    }
 
-        val dis = Single.zip(newSingle, popularSingle, { new, popular ->
-            /**
-             * "Сортировка" по категориям
-             **/
-            val sorted = arrayListOf<Pair<MovieType, List<Movie>>>()
+    fun processPopularLoading() {
+        loadingPopular.postValue(true)
+    }
 
-            sorted.add(Pair(MovieType.NOW_PLAYING, new))
-            sorted.add(Pair(MovieType.POPULAR, popular))
+    fun navigateToProfile() {
+        router.navigateTo(Screens.profile())
+    }
 
-            return@zip sorted.toList()
-        })
-            .subscribeOn(Schedulers.io()) // TODO вот эти две штуки особо выжные, они отвечают за то, в каком потоке будет происходить обработка данных
-            .observeOn(AndroidSchedulers.mainThread())  // TODO обзательно посомтри вот это https://proandroiddev.com/understanding-rxjava-subscribeon-and-observeon-744b0c6a41ea
-            .doOnSubscribe {
-                error.postValue(false)
-            }
+    fun navigateToMovieDetail(id: Int) {
+        router.navigateTo(Screens.movieDetail(id))
+    }
+
+    private fun setup() {
+        getUser()
+
+        Flowable.zip(getNowPlayingMoviesUseCase(MovieSortType.NO), getPopularMoviesUseCase(MovieSortType.NO), { nowPlaying, popular ->
+            nowPlayingAdapter.run { viewModelScope.launch(Dispatchers.Main) { submitData(nowPlaying) } }
+            popularAdapter.run { viewModelScope.launch(Dispatchers.Main) { submitData(popular) } }
+//            mPopularPagingLiveData.postValue(popular)
+        }).subscribe({
+
+        }, {
+
+        }).addToComposite()
+    }
+
+    private fun getUser() {
+        getUserUseCase()
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
             .subscribe({
-                /**
-                 * У меня тут 2 категории разные, и они в разных лайвдате лежат, не придумал способа лучше для разделения (опираюсь на тудушку выше, что работа должна проиходить здесь)
-                 **/
-                for (item in it) {
-                    when(item.first) {
-                        MovieType.POPULAR -> mPopularMovies.postValue(item.second)
-                        MovieType.NOW_PLAYING -> mNowPlayingMovies.postValue(item.second)
-                    }
-                }
-
-                loading.postValue(false)
+                syncLocalUserListsUseCase(it.id).addToComposite()
+                user.postValue(it)
             }, {
-                error.postValue(true)
-                loading.postValue(false)
+                Timber.e(it)
             })
-
-        compositeDisposable.add(dis)
+            .addToComposite()
     }
+
+    fun progressCheck() = loadingPopular.value == true && loadingNowPlaying.value == true
 }
